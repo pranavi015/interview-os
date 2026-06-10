@@ -1,42 +1,233 @@
 import { Document } from "@langchain/core/documents";
+import { supabase } from "./db";
 
-// Simple in-memory vector store using keyword matching instead of embeddings.
-// This avoids needing MemoryVectorStore or any embedding API key for dev.
-// TODO: Replace with SupabaseVectorStore + pgvector + real embeddings in production.
-
-const knowledgeDocs: Document[] = [
-  new Document({ pageContent: "React Reconciliation is the algorithm React uses to diff the virtual DOM. When state changes, React creates a new virtual DOM tree and compares it with the previous one using a diffing algorithm that runs in O(n) time. Keys in lists help React track which items changed.", metadata: { topic: "React" } }),
-  new Document({ pageContent: "React Hooks rules: only call hooks at the top level (not inside loops or conditionals), only call hooks from React function components or custom hooks. useState returns [state, setter]. useEffect runs after render and can return a cleanup function.", metadata: { topic: "React" } }),
-  new Document({ pageContent: "useCallback memoizes a function reference, useMemo memoizes a computed value. Use them to avoid unnecessary re-renders of child components that receive these as props. React.memo wraps a component to skip re-renders if props haven't changed.", metadata: { topic: "React" } }),
-  new Document({ pageContent: "JavaScript Event Loop: The call stack runs synchronous code. The microtask queue (Promises, queueMicrotask) drains completely after each task. The macrotask queue (setTimeout, setInterval) runs one task at a time. Microtasks always run before the next macrotask.", metadata: { topic: "JavaScript" } }),
-  new Document({ pageContent: "JavaScript Closures: A closure is a function that captures variables from its enclosing lexical scope even after the outer function has returned. Common use cases: data encapsulation, factory functions, memoization, partial application.", metadata: { topic: "JavaScript" } }),
-  new Document({ pageContent: "JavaScript Promises vs async/await: async/await is syntactic sugar over Promises. await pauses execution inside an async function until the Promise resolves. Promise.all runs Promises concurrently and rejects fast if any rejects. Promise.allSettled waits for all regardless of rejection.", metadata: { topic: "JavaScript" } }),
-  new Document({ pageContent: "TypeScript Generics allow you to write reusable, type-safe components. Example: function identity<T>(arg: T): T. Common generic utilities: Partial<T>, Required<T>, Pick<T, K>, Omit<T, K>, Readonly<T>, Record<K, V>.", metadata: { topic: "TypeScript" } }),
-  new Document({ pageContent: "System Design — Load Balancers distribute incoming traffic across multiple servers. Types: Round Robin, Least Connections, IP Hash. Load balancers also handle health checks and SSL termination. Examples: Nginx, AWS ALB.", metadata: { topic: "System Design" } }),
-  new Document({ pageContent: "System Design — CAP Theorem: A distributed system can only guarantee 2 of 3: Consistency (every read returns the latest write), Availability (every request gets a response), Partition Tolerance (system works despite network partitions). In practice, partition tolerance is required, so you choose between CP or AP systems.", metadata: { topic: "System Design" } }),
-  new Document({ pageContent: "System Design — Database Sharding splits data across multiple databases by a shard key. Vertical sharding splits by column groups; horizontal sharding (partitioning) splits by rows. Challenges include cross-shard queries and rebalancing.", metadata: { topic: "System Design" } }),
-  new Document({ pageContent: "Data Structures — Big O Complexity. Array access O(1), search O(n). Hash Map get/set O(1) average. Binary Search O(log n). Sorting (Merge/Quick) O(n log n). Graph BFS/DFS O(V+E). Heap insert/extract O(log n).", metadata: { topic: "DSA" } }),
-  new Document({ pageContent: "Data Structures — Binary Trees: In-order traversal (left, root, right) gives sorted output for BSTs. Pre-order (root, left, right) is used for copying trees. Post-order (left, right, root) is used for deletion. Level-order uses a queue (BFS).", metadata: { topic: "DSA" } }),
-  new Document({ pageContent: "CSS Box Model: content → padding → border → margin. box-sizing: border-box makes width/height include padding and border. Flexbox: justify-content aligns on main axis, align-items aligns on cross axis. Grid: use grid-template-columns and grid-template-rows.", metadata: { topic: "CSS" } }),
-  new Document({ pageContent: "Next.js App Router: Server Components render on the server by default and cannot use hooks or browser APIs. Add 'use client' directive to make a component a Client Component. Server Actions allow calling server-side functions directly from client components using the 'use server' directive.", metadata: { topic: "Next.js" } }),
-];
+// ─── Chunking ─────────────────────────────────────────────────────────────────
 
 /**
- * Simple keyword-based similarity retrieval.
- * Scores each document by counting how many query words appear in its content.
+ * Splits a long text into overlapping chunks for retrieval.
+ * Uses sentence boundaries where possible.
  */
-function scoreDocument(query: string, doc: Document): number {
-  const words = query.toLowerCase().split(/\s+/).filter(w => w.length > 2);
-  const content = doc.pageContent.toLowerCase();
-  let score = 0;
-  for (const word of words) {
-    if (content.includes(word)) score++;
+export function chunkText(
+  text: string,
+  chunkSize = 500,
+  overlap = 100
+): string[] {
+  const sentences = text.split(/(?<=[.!?])\s+/);
+  const chunks: string[] = [];
+  let current = "";
+
+  for (const sentence of sentences) {
+    if ((current + " " + sentence).length > chunkSize) {
+      if (current.length > 0) {
+        chunks.push(current.trim());
+        // Overlap: carry last `overlap` chars into next chunk
+        current = current.slice(-overlap) + " " + sentence;
+      } else {
+        // Sentence itself is too long — force split
+        chunks.push(sentence.slice(0, chunkSize));
+        current = sentence.slice(chunkSize - overlap);
+      }
+    } else {
+      current = current ? current + " " + sentence : sentence;
+    }
   }
+
+  if (current.trim().length > 0) {
+    chunks.push(current.trim());
+  }
+
+  return chunks;
+}
+
+// ─── TF-IDF Keyword Embedding ─────────────────────────────────────────────────
+
+/**
+ * Converts a text to a sparse TF-IDF style keyword vector.
+ * Used when a real embedding model is unavailable.
+ */
+function tokenize(text: string): string[] {
+  return text
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .split(/\s+/)
+    .filter((w) => w.length > 2);
+}
+
+function computeTfIdf(query: string, doc: string): number {
+  const queryTokens = new Set(tokenize(query));
+  const docTokens = tokenize(doc);
+  const docFreq = new Map<string, number>();
+
+  for (const token of docTokens) {
+    docFreq.set(token, (docFreq.get(token) || 0) + 1);
+  }
+
+  let score = 0;
+  for (const token of queryTokens) {
+    const tf = (docFreq.get(token) || 0) / docTokens.length;
+    score += tf;
+  }
+
   return score;
 }
 
-export async function retrieveRelevantDocs(query: string, topK = 3): Promise<Document[]> {
-  const scored = knowledgeDocs.map(doc => ({ doc, score: scoreDocument(query, doc) }));
+// ─── In-Memory Document Index ─────────────────────────────────────────────────
+
+interface IndexedDocument {
+  id: string;
+  content: string;
+  metadata: Record<string, string>;
+}
+
+const memoryIndex: IndexedDocument[] = [];
+
+/**
+ * Adds chunks to the in-memory index (used as fallback when Supabase is not configured).
+ */
+export function indexDocuments(
+  chunks: string[],
+  metadata: Record<string, string>
+) {
+  for (const chunk of chunks) {
+    memoryIndex.push({
+      id: `${metadata.source}-${memoryIndex.length}`,
+      content: chunk,
+      metadata,
+    });
+  }
+}
+
+/**
+ * Retrieves the top-K relevant chunks from in-memory index using TF-IDF scoring.
+ */
+export function retrieveFromMemory(
+  query: string,
+  topK = 4,
+  filter?: Record<string, string>
+): Document[] {
+  let pool = memoryIndex;
+
+  if (filter) {
+    pool = pool.filter((doc) =>
+      Object.entries(filter).every(([k, v]) => doc.metadata[k] === v)
+    );
+  }
+
+  const scored = pool.map((doc) => ({
+    doc,
+    score: computeTfIdf(query, doc.content),
+  }));
+
   scored.sort((a, b) => b.score - a.score);
-  return scored.slice(0, topK).filter(s => s.score > 0).map(s => s.doc);
+
+  return scored
+    .slice(0, topK)
+    .filter((s) => s.score > 0)
+    .map(
+      (s) =>
+        new Document({
+          pageContent: s.doc.content,
+          metadata: s.doc.metadata,
+        })
+    );
+}
+
+// ─── Supabase pgvector Pipeline ───────────────────────────────────────────────
+
+/**
+ * Stores document chunks in Supabase with a placeholder embedding vector.
+ * When a real embedding model is connected, replace the null vector with actual embeddings.
+ */
+export async function storeChunksInSupabase(
+  chunks: string[],
+  metadata: Record<string, string>,
+  profileId = "default-user"
+): Promise<void> {
+  if (!supabase) {
+    // Fallback to in-memory index
+    indexDocuments(chunks, metadata);
+    return;
+  }
+
+  const rows = chunks.map((chunk) => ({
+    profile_id: profileId,
+    file_path: metadata.source || "unknown",
+    content: chunk,
+    embedding: null, // TODO: Replace with real embedding vector from OpenAI/HuggingFace
+    metadata: { ...metadata },
+  }));
+
+  const { error } = await supabase.from("documents").insert(rows);
+
+  if (error) {
+    console.error("Supabase pgvector insert failed:", error);
+    // Fallback to in-memory
+    indexDocuments(chunks, metadata);
+  }
+}
+
+/**
+ * Retrieves relevant chunks from Supabase via text search (full-text when pgvector embeddings unavailable).
+ * When real embeddings are added, this should call the `match_documents` RPC function.
+ */
+export async function retrieveFromSupabase(
+  query: string,
+  topK = 4,
+  filter?: { profile_id?: string }
+): Promise<Document[]> {
+  if (!supabase) {
+    return retrieveFromMemory(query);
+  }
+
+  // Use Supabase full-text search as interim until embeddings are enabled
+  let queryBuilder = supabase
+    .from("documents")
+    .select("content, metadata, file_path")
+    .textSearch("content", query.split(" ").join(" | "), { type: "websearch" })
+    .limit(topK);
+
+  if (filter?.profile_id) {
+    queryBuilder = queryBuilder.eq("profile_id", filter.profile_id);
+  }
+
+  const { data, error } = await queryBuilder;
+
+  if (error || !data || data.length === 0) {
+    // Fallback to in-memory TF-IDF
+    return retrieveFromMemory(query, topK);
+  }
+
+  return data.map(
+    (row: any) =>
+      new Document({
+        pageContent: row.content,
+        metadata: row.metadata || { source: row.file_path },
+      })
+  );
+}
+
+// ─── Main Retrieval Entry Point ───────────────────────────────────────────────
+
+/**
+ * Universal retrieval function. Automatically routes to Supabase or in-memory fallback.
+ */
+export async function retrieveRelevantDocs(
+  query: string,
+  topK = 4,
+  filter?: { profile_id?: string }
+): Promise<Document[]> {
+  return retrieveFromSupabase(query, topK, filter);
+}
+
+/**
+ * Ingests a block of text (resume, README, JD) by chunking and storing it.
+ */
+export async function ingestText(
+  text: string,
+  metadata: Record<string, string>,
+  profileId = "default-user"
+): Promise<void> {
+  const chunks = chunkText(text);
+  await storeChunksInSupabase(chunks, metadata, profileId);
+  console.log(`Ingested ${chunks.length} chunks from ${metadata.source}`);
 }

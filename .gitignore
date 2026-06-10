@@ -40,6 +40,6 @@ yarn-error.log*
 *.tsbuildinfo
 next-env.d.ts
 
-# claude
-Agents.md 
-Claude.md 
+# AI Agent memory and rules files
+CLAUDE.md
+AGENTS.md
