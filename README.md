@@ -219,18 +219,6 @@ Embeddings need an API call per ingested resume and GitHub file, adding latency 
 
 ---
 
-## Roadmap
-
-- Switch retrieval from TF-IDF to real embeddings (pgvector is ready)
-- Retrieval and answer-quality evaluation set
-- Multi-session learning insights
-- ElevenLabs voice synthesis for a more realistic interviewer
-- Company-specific question banks (Google, Meta, Amazon modes)
-- Session replay with timestamped transcripts
-- Mobile PWA
-
----
-
 ## Author
 
 **Pranavi Mathur**, building at the intersection of AI engineering, product engineering and full-stack development.
